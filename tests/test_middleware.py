@@ -441,6 +441,83 @@ def test_upstream_url_resolution():
           _resolve_upstream_url(req, _Req({"Responses-API-Base": " "})) is None)
 
 
+# --- transparent passthrough URL mapping (models + other endpoints) ----------
+
+
+class _PURL:
+    def __init__(self, path: str, query: str = ""):
+        self.path = path
+        self.query = query
+
+
+class _PReq:
+    """Minimal request fake for passthrough URL resolution (path + query + headers)."""
+
+    def __init__(self, path: str, headers: dict | None = None, query: str = ""):
+        self.url = _PURL(path, query)
+        self.headers = Headers(headers or {})
+
+
+def test_passthrough_url_resolution():
+    from middleware.app import _resolve_passthrough_url
+
+    base = load_config(ROOT / "config.toml")
+    base = replace(base, server=replace(base.server, listen_paths=("/v1/responses",)))
+
+    fixed = replace(base, upstream=replace(base.upstream, mode="fixed",
+                    url="https://h/v1/responses"))
+    check("pt /v1/models -> base/models",
+          _resolve_passthrough_url(fixed, _PReq("/v1/models")) == "https://h/v1/models")
+    check("pt /v1/embeddings -> base/embeddings",
+          _resolve_passthrough_url(fixed, _PReq("/v1/embeddings")) == "https://h/v1/embeddings")
+    check("pt /v1/responses maps back to responses endpoint",
+          _resolve_passthrough_url(fixed, _PReq("/v1/responses")) == "https://h/v1/responses")
+    check("pt preserves query string",
+          _resolve_passthrough_url(fixed, _PReq("/v1/models", query="limit=10"))
+          == "https://h/v1/models?limit=10")
+
+    # ChatGPT-style URL: strip '/responses' -> base path is /backend-api/codex.
+    cg = replace(base, upstream=replace(base.upstream, mode="fixed",
+                 url="https://chatgpt.com/backend-api/codex/responses"))
+    check("pt chatgpt base mapping",
+          _resolve_passthrough_url(cg, _PReq("/v1/models"))
+          == "https://chatgpt.com/backend-api/codex/models")
+
+    # header mode: base derived from the Responses-API-Base header.
+    header = replace(base, upstream=replace(base.upstream, mode="header",
+                     url="https://cfg/responses"))
+    check("pt header base mapping",
+          _resolve_passthrough_url(header, _PReq("/v1/models",
+               headers={"Responses-API-Base": "https://ov/v1"})) == "https://ov/v1/models")
+
+    # header_required without header -> None (caller returns 400).
+    req = replace(base, upstream=replace(base.upstream, mode="header_required",
+                  url="https://cfg/responses"))
+    check("pt header_required no header -> None",
+          _resolve_passthrough_url(req, _PReq("/v1/models")) is None)
+
+
+async def test_passthrough_preserves_method():
+    from middleware.proxy import open_passthrough
+    seen: dict = {}
+
+    class _CapClient:
+        def build_request(self, *a, **k):
+            seen["method"] = a[0] if a else k.get("method")
+            return ("req", a, k)
+
+        async def send(self, req, stream=True):
+            return FakeResp(b'{"data": []}', status=200)
+
+    await open_passthrough(_CapClient(), "https://h/v1/models", b"", {}, method="GET")
+    check("passthrough forwards GET method", seen.get("method") == "GET", str(seen))
+    await open_passthrough(_CapClient(), "https://h/v1/responses", b"{}", {}, method="POST")
+    check("passthrough forwards POST method", seen.get("method") == "POST")
+    seen.clear()
+    await open_passthrough(_CapClient(), "https://h/v1/models", b"", {})  # default
+    check("passthrough defaults to POST", seen.get("method") == "POST", str(seen))
+
+
 # --- security guard: never send config creds to a header-supplied URL --------
 
 
@@ -624,6 +701,8 @@ async def _main():
     await test_forward_marker_emits_downstream()
     test_header_transparency()
     test_upstream_url_resolution()
+    test_passthrough_url_resolution()
+    await test_passthrough_preserves_method()
     test_auth_safety_guard()
     test_auth_injection()
     test_reasoning_gate()
