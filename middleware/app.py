@@ -301,5 +301,9 @@ def create_app(cfg: Config) -> Starlette:
     # Catch-all transparent passthrough for everything else (GET /v1/models, etc.).
     # Fold routes are POST-only and listed first, so they win on full match; any other
     # path/method falls through here and is forwarded to the upstream unchanged.
-    routes.append(Route("/{path:path}", handle_passthrough))
+    routes.append(Route(
+        "/{path:path}",
+        handle_passthrough,
+        methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    ))
     return Starlette(routes=routes, lifespan=lifespan)

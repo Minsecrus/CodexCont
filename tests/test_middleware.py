@@ -518,6 +518,48 @@ async def test_passthrough_preserves_method():
     check("passthrough defaults to POST", seen.get("method") == "POST", str(seen))
 
 
+async def test_passthrough_routing():
+    """Exercise Starlette's router, not just the passthrough helper functions."""
+    import httpx
+    import middleware.app as app_module
+    from starlette.responses import PlainTextResponse
+
+    async def fold_marker(request):
+        return PlainTextResponse(f"FOLD {request.method}")
+
+    async def passthrough_marker(request):
+        return PlainTextResponse(f"PASS {request.method}")
+
+    # create_app captures the handlers in Route objects, so restoring the module
+    # globals immediately afterward keeps this test isolated from the rest.
+    original_fold = app_module.handle_responses
+    original_passthrough = app_module.handle_passthrough
+    try:
+        app_module.handle_responses = fold_marker
+        app_module.handle_passthrough = passthrough_marker
+        app = app_module.create_app(load_config(ROOT / "config.toml"))
+    finally:
+        app_module.handle_responses = original_fold
+        app_module.handle_passthrough = original_passthrough
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        for method in ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"):
+            response = await client.request(method, "/v1/models")
+            check(f"route passes {method}", response.status_code == 200,
+                  f"status={response.status_code}")
+            if method != "HEAD":
+                check(f"route dispatches {method} to passthrough",
+                      response.text == f"PASS {method}", response.text)
+
+        response = await client.post("/v1/responses")
+        check("route keeps POST /v1/responses on fold handler",
+              response.text == "FOLD POST", response.text)
+        response = await client.get("/v1/responses")
+        check("route sends GET /v1/responses to passthrough",
+              response.text == "PASS GET", response.text)
+
+
 # --- security guard: never send config creds to a header-supplied URL --------
 
 
@@ -703,6 +745,7 @@ async def _main():
     test_upstream_url_resolution()
     test_passthrough_url_resolution()
     await test_passthrough_preserves_method()
+    await test_passthrough_routing()
     test_auth_safety_guard()
     test_auth_injection()
     test_reasoning_gate()
